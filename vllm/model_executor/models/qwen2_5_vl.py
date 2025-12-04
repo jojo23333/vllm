@@ -1014,6 +1014,7 @@ class Qwen2_5_VLMultiModalProcessor(Qwen2VLMultiModalProcessor):
 
             # EVS-specific code
             video_pruning_rate = self.info.ctx.get_mm_config().video_pruning_rate
+            video_pruning_method = self.info.ctx.get_mm_config().video_pruning_method
             if (
                 modality == "video"
                 and video_pruning_rate is not None
@@ -1027,6 +1028,7 @@ class Qwen2_5_VLMultiModalProcessor(Qwen2VLMultiModalProcessor):
                     tokens_per_frame,
                     T,
                     video_pruning_rate,
+                    method=video_pruning_method,
                 )
             # End of EVS-specific code
 
@@ -1214,6 +1216,7 @@ class Qwen2_5_VLForConditionalGeneration(
         self.vllm_config = vllm_config
         self.multimodal_config = multimodal_config
         self.video_pruning_rate = multimodal_config.video_pruning_rate
+        self.video_pruning_method = multimodal_config.video_pruning_method
         self.is_multimodal_pruning_enabled = (
             multimodal_config.is_multimodal_pruning_enabled()
         )
@@ -1433,6 +1436,7 @@ class Qwen2_5_VLForConditionalGeneration(
                 size,
                 spatial_merge_size=self.visual.spatial_merge_size,
                 q=self.video_pruning_rate,
+                method=self.video_pruning_method,
             )
             positions = compute_mrope_for_media(
                 size,
