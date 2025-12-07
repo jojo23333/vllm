@@ -140,7 +140,7 @@ class MultiModalConfig:
     estimating the peak memory usage of the activation of multimodal encoder and
     embedding cache."""
     video_pruning_rate: float | None = Field(default=None, ge=0.0, lt=1.0)
-    video_pruning_method: str = Field(default="evs")
+    video_pruning_method: str | None = Field(default=None)
     """Sets pruning rate for video pruning via Efficient Video Sampling.
     Value sits in range [0;1) and determines fraction of media tokens
     from each video to be pruned.

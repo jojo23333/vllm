@@ -1015,6 +1015,7 @@ class Qwen2_5_VLMultiModalProcessor(Qwen2VLMultiModalProcessor):
             # EVS-specific code
             video_pruning_rate = self.info.ctx.get_mm_config().video_pruning_rate
             video_pruning_method = self.info.ctx.get_mm_config().video_pruning_method
+            logger.warning_once(f"video_pruning_rate: {video_pruning_rate}, video_pruning_method: {video_pruning_method}")
             if (
                 modality == "video"
                 and video_pruning_rate is not None
@@ -1210,13 +1211,16 @@ class Qwen2_5_VLForConditionalGeneration(
         super().__init__()
         config: Qwen2_5_VLConfig = vllm_config.model_config.hf_config
         multimodal_config = vllm_config.model_config.multimodal_config
-
         self.use_data_parallel = multimodal_config.mm_encoder_tp_mode == "data"
         self.config = config
         self.vllm_config = vllm_config
         self.multimodal_config = multimodal_config
         self.video_pruning_rate = multimodal_config.video_pruning_rate
         self.video_pruning_method = multimodal_config.video_pruning_method
+        logger.warning_once(
+            f"Video pruning rate is set to {self.video_pruning_rate} "
+            f"with method {self.video_pruning_method}."
+        )
         self.is_multimodal_pruning_enabled = (
             multimodal_config.is_multimodal_pruning_enabled()
         )

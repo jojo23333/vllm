@@ -9,8 +9,13 @@
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
 import typing
-
+# from torch_geometric.nn.pool import fps
+from fps_custom_op import fps
+from vllm.logger import init_logger
+logger = init_logger(__name__)
 import torch
+import math
+import torch.nn.functional as F
 
 
 def compute_retained_tokens_count(
@@ -30,7 +35,7 @@ def compute_retained_tokens_count(
         The number of retained tokens.
     """
 
-    if method == "evs":
+    if method in ["evs"]:
         total_tokens = tokens_per_frame * num_frames
         evs_num_tokens = int(total_tokens * (1 - q))
         min_num_tokens = tokens_per_frame
@@ -39,17 +44,23 @@ def compute_retained_tokens_count(
         retained_tokens_per_frame = max(1, int(tokens_per_frame * (1.0 - q)))
         retained_tokens_per_frame = min(retained_tokens_per_frame, tokens_per_frame)
         return retained_tokens_per_frame * num_frames
-
+    elif method in ["fps_block2", "fps_block4", "fps_block8"]:
+        TEMPORAL_BLOCK_SIZE = int(method.split("_")[-1].replace("block", ""))
+        retained_tokens_per_block = max(1, math.ceil(TEMPORAL_BLOCK_SIZE * tokens_per_frame * (1.0 - q)))
+        retained_tokens = (num_frames // TEMPORAL_BLOCK_SIZE) * retained_tokens_per_block +\
+            math.ceil((num_frames % TEMPORAL_BLOCK_SIZE) * tokens_per_frame * (1.0 - q))
+        return retained_tokens
 
 def compute_retention_mask(
     video_embeds: torch.Tensor,
     video_size_thw: torch.LongTensor | tuple[int, int, int],
     spatial_merge_size: int,
     q: float,
-    method: str = "evs",
+    method: str = "evs"
 ) -> torch.Tensor:
+    logger.warning_once(f"Computing retention mask using method: {method}")
     if method == "evs":
-        return compute_evs_retention_mask_evs(
+        return compute_retention_mask_evs(
             video_embeds, video_size_thw, spatial_merge_size, q
         )
     elif method == "random":
@@ -60,12 +71,94 @@ def compute_retention_mask(
         return compute_retention_mask_topk_norm(
             video_embeds, video_size_thw, spatial_merge_size, q
         )
+    elif method in ["fps_block2", "fps_block4", "fps_block8"]:
+        block_size = int(method.split("_")[-1].replace("block", ""))
+        return compute_retention_mask_fps(
+            video_embeds,
+            video_size_thw,
+            spatial_merge_size,
+            q,
+            block_size=block_size,
+        )
+        
+
+def random_projection(tokens, target_dim=128):
+    """
+    Args:
+        tokens: (Batch, N, Dim) - Your video tokens (e.g., 6400 x 768)
+        target_dim: int - The low dimension to project to (e.g., 16)
+    Returns:
+        projected_tokens: (Batch, N, target_dim)
+    """
+    n_tokens, original_dim = tokens.shape
+    
+    # 1. Create a static random matrix (Frozen, do not train this!)
+    # We sample from Normal(0, 1/target_dim) to preserve dot product magnitude
+    projection_matrix = torch.randn(original_dim, target_dim, device=tokens.device) 
+    projection_matrix = projection_matrix / (target_dim ** 0.5)
+    
+    # 2. Project
+    # (B, N, D) @ (D, d) -> (B, N, d)
+    projected = torch.matmul(tokens, projection_matrix)
+    
+    return projected
+        
+def compute_retention_mask_fps(
+    video_embeds: torch.Tensor,
+    video_size_thw: torch.LongTensor | tuple[int, int, int],
+    spatial_merge_size: int,
+    q: float,
+    block_size: int,
+) -> torch.Tensor:
+    """
+        Use farthest point sampling.
+        If keep_first is True, all tokens from the first frame are kept
+        and the remaining budget is selected via FPS.
+    """
+    T, H, W = map(int, video_size_thw)
+
+    assert 0.0 <= q < 1.0, f"q must be in [0, 1), got {q}"
+    assert H % spatial_merge_size == 0, \
+        f"H={H} must be divisible by spatial_merge_size={spatial_merge_size}"
+    assert W % spatial_merge_size == 0, \
+        f"W={W} must be divisible by spatial_merge_size={spatial_merge_size}"
+
+    H_merged = H // spatial_merge_size
+    W_merged = W // spatial_merge_size
+    tokens_per_frame = H_merged * W_merged
+    total_tokens = tokens_per_frame * T
+
+    retained_tokens = compute_retained_tokens_count(tokens_per_frame, T, q, method="fps")
+
+    device = video_embeds.device
+    points = video_embeds.reshape(total_tokens, video_embeds.size(-1)).to(torch.float32)
+    points = points / (torch.linalg.norm(points, dim=-1, keepdim=True) + 1e-8)
+    
+    points = random_projection(points, target_dim=128)
+
+    batch = torch.arange(T, device=points.device).unsqueeze(1).expand(-1, tokens_per_frame).reshape(-1)
+    batch = batch // block_size  # Group frames into blocks
+
+    # logger.warning(f"Shape of points for FPS: {points.shape} Shape of batch: {batch.shape}")
+    sampled_indices = fps(
+        points,
+        batch=batch,
+        ratio=1.0-q,
+        random_start=True,
+    )
+    # logger.warning(f"Shape of sampled indices: {sampled_indices.shape} Rentained_tokens: {retained_tokens}")
+    # logger.warning(f"Sampled indices min/max: {sampled_indices}")
+    sampled_indices = sampled_indices.view(-1)[:retained_tokens]
+
+    retention_mask = torch.zeros(total_tokens, dtype=torch.bool, device=device)
+    retention_mask[sampled_indices] = True
+    return retention_mask
         
 def compute_retention_mask_topk_norm(
     video_embeds: torch.Tensor,
     video_size_thw: torch.LongTensor | tuple[int, int, int],
     spatial_merge_size: int,
-    q: float,
+    q: float
 ) -> torch.Tensor:
     """
         Computes a top-k norm retention mask for input video embeddings.
