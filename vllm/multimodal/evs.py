@@ -44,7 +44,7 @@ def compute_retained_tokens_count(
         retained_tokens_per_frame = max(1, int(tokens_per_frame * (1.0 - q)))
         retained_tokens_per_frame = min(retained_tokens_per_frame, tokens_per_frame)
         return retained_tokens_per_frame * num_frames
-    elif method in ["fps_block2", "fps_block4", "fps_block8"]:
+    elif method in ["fps_block2", "fps_block4", "fps_block8", "fps_block16"]:
         TEMPORAL_BLOCK_SIZE = int(method.split("_")[-1].replace("block", ""))
         retained_tokens_per_block = max(1, math.ceil(TEMPORAL_BLOCK_SIZE * tokens_per_frame * (1.0 - q)))
         retained_tokens = (num_frames // TEMPORAL_BLOCK_SIZE) * retained_tokens_per_block +\
@@ -71,7 +71,7 @@ def compute_retention_mask(
         return compute_retention_mask_topk_norm(
             video_embeds, video_size_thw, spatial_merge_size, q
         )
-    elif method in ["fps_block2", "fps_block4", "fps_block8"]:
+    elif method in ["fps_block2", "fps_block4", "fps_block8", "fps_block16"]:
         block_size = int(method.split("_")[-1].replace("block", ""))
         return compute_retention_mask_fps(
             video_embeds,
