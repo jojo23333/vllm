@@ -44,11 +44,13 @@ def compute_retained_tokens_count(
         retained_tokens_per_frame = max(1, int(tokens_per_frame * (1.0 - q)))
         retained_tokens_per_frame = min(retained_tokens_per_frame, tokens_per_frame)
         return retained_tokens_per_frame * num_frames
-    elif method in ["fps_block2", "fps_block4", "fps_block8", "fps_block16"]:
+    elif method in ["fps_block1", "fps_block2", "fps_block4", "fps_block8", "fps_block16"]:
         TEMPORAL_BLOCK_SIZE = int(method.split("_")[-1].replace("block", ""))
-        retained_tokens_per_block = max(1, math.ceil(TEMPORAL_BLOCK_SIZE * tokens_per_frame * (1.0 - q)))
-        retained_tokens = (num_frames // TEMPORAL_BLOCK_SIZE) * retained_tokens_per_block +\
-            math.ceil((num_frames % TEMPORAL_BLOCK_SIZE) * tokens_per_frame * (1.0 - q))
+        ratio = 1.0 - q
+        retained_tokens_per_block = max(1, math.ceil(TEMPORAL_BLOCK_SIZE * tokens_per_frame * ratio - 1e-6))
+        retained_tokens = (num_frames // TEMPORAL_BLOCK_SIZE) * retained_tokens_per_block + \
+            math.ceil(round((num_frames % TEMPORAL_BLOCK_SIZE) * tokens_per_frame * ratio, 6))
+        logger.warning(f"Retained tokens for method {method}: shape{num_frames}x{tokens_per_frame} r{1.0-q} {retained_tokens}")
         return retained_tokens
 
 def compute_retention_mask(
@@ -71,7 +73,7 @@ def compute_retention_mask(
         return compute_retention_mask_topk_norm(
             video_embeds, video_size_thw, spatial_merge_size, q
         )
-    elif method in ["fps_block2", "fps_block4", "fps_block8", "fps_block16"]:
+    elif method in ["fps_block1", "fps_block2", "fps_block4", "fps_block8", "fps_block16"]:
         block_size = int(method.split("_")[-1].replace("block", ""))
         return compute_retention_mask_fps(
             video_embeds,
@@ -128,7 +130,7 @@ def compute_retention_mask_fps(
     tokens_per_frame = H_merged * W_merged
     total_tokens = tokens_per_frame * T
 
-    retained_tokens = compute_retained_tokens_count(tokens_per_frame, T, q, method="fps")
+    retained_tokens = compute_retained_tokens_count(tokens_per_frame, T, q, method=f"fps_block{block_size}")
 
     device = video_embeds.device
     points = video_embeds.reshape(total_tokens, video_embeds.size(-1)).to(torch.float32)
@@ -148,7 +150,20 @@ def compute_retention_mask_fps(
     )
     # logger.warning(f"Shape of sampled indices: {sampled_indices.shape} Rentained_tokens: {retained_tokens}")
     # logger.warning(f"Sampled indices min/max: {sampled_indices}")
-    sampled_indices = sampled_indices.view(-1)[:retained_tokens]
+    sampled_indices = sampled_indices.view(-1)
+    # torch.save(
+    #     {
+    #         "H_merged": H_merged,
+    #         "W_merged": W_merged, 
+    #         "T": T,
+    #         "points": points,
+    #         "batch": batch,
+    #         "sampled_indices": sampled_indices,
+    #         "retained_tokens": retained_tokens,
+    #         "video_embeds": video_embeds
+    #     },
+    #     "debug.pt",
+    # )
 
     retention_mask = torch.zeros(total_tokens, dtype=torch.bool, device=device)
     retention_mask[sampled_indices] = True
