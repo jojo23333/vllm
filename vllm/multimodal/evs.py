@@ -50,6 +50,45 @@ def compute_retained_tokens_count(
         retained_tokens = (num_frames // TEMPORAL_BLOCK_SIZE) * retained_tokens_per_block +\
             math.ceil((num_frames % TEMPORAL_BLOCK_SIZE) * tokens_per_frame * (1.0 - q))
         return retained_tokens
+    elif method.startswith("fps_st"):
+        spatial_block_size = int(method.split("_")[-2])
+        temporal_block_size = int(method.split("_")[-1])
+        total_retained = 0
+        
+        # Grid dimensions (number of blocks)
+        grid_t = (T + temporal_block_size - 1) // temporal_block_size
+        grid_h = (H_tokens + spatial_block_size - 1) // spatial_block_size
+        grid_w = (W_tokens + spatial_block_size - 1) // spatial_block_size
+        
+        # We simulate the loops to calculate exact token counts per block
+        # Since grid sizes are usually small, a triple loop is negligible in CPU time
+        # compared to the rest of the model. 
+        # Alternatively, we can use math to calculate "full" blocks vs "edge" blocks.
+        
+        for gt in range(grid_t):
+            # Calculate actual temporal depth of this block
+            curr_t_start = gt * temporal_block_size
+            curr_t_end = min(curr_t_start + temporal_block_size, T)
+            d_t = curr_t_end - curr_t_start
+            
+            for gh in range(grid_h):
+                curr_h_start = gh * spatial_block_size
+                curr_h_end = min(curr_h_start + spatial_block_size, H_tokens)
+                d_h = curr_h_end - curr_h_start
+                
+                for gw in range(grid_w):
+                    curr_w_start = gw * spatial_block_size
+                    curr_w_end = min(curr_w_start + spatial_block_size, W_tokens)
+                    d_w = curr_w_end - curr_w_start
+                    
+                    # Total tokens in this specific block
+                    block_volume = d_t * d_h * d_w
+                    
+                    # Apply retention ratio and ceil/max logic
+                    kept = max(1, math.ceil(block_volume * (1.0 - q)))
+                    total_retained += kept
+                    
+        return total_retained
 
 def compute_retention_mask(
     video_embeds: torch.Tensor,
@@ -80,6 +119,17 @@ def compute_retention_mask(
             q,
             block_size=block_size,
         )
+    elif method.startswith("fps_st"):
+        spatial_block_size = int(method.split("_")[-2])
+        temporal_block_size = int(method.split("_")[-1])
+        return compute_retention_mask_fps_spatial_temporal(
+            video_embeds,
+            video_size_thw,
+            spatial_merge_size,
+            q,
+            temporal_block_size=temporal_block_size,
+            spatial_block_size=spatial_block_size,
+        )
         
 
 def random_projection(tokens, target_dim=128):
@@ -102,7 +152,100 @@ def random_projection(tokens, target_dim=128):
     projected = torch.matmul(tokens, projection_matrix)
     
     return projected
-        
+
+def compute_retention_mask_fps_spatial_temporal(
+    video_embeds: torch.Tensor,
+    video_size_thw: torch.LongTensor | tuple[int, int, int],
+    spatial_merge_size: int,
+    q: float,
+    temporal_block_size: int,
+    spatial_block_size: int,
+) -> torch.Tensor:
+    """
+    Use farthest point sampling with Spatiotemporal Blocking.
+    """
+    T, H, W = map(int, video_size_thw)
+
+    assert 0.0 <= q < 1.0, f"q must be in [0, 1), got {q}"
+    assert H % spatial_merge_size == 0, \
+        f"H={H} must be divisible by spatial_merge_size={spatial_merge_size}"
+    assert W % spatial_merge_size == 0, \
+        f"W={W} must be divisible by spatial_merge_size={spatial_merge_size}"
+
+    # 1. Determine Token Grid Dimensions
+    H_tokens = H // spatial_merge_size
+    W_tokens = W // spatial_merge_size
+    tokens_per_frame = H_tokens * W_tokens
+    total_tokens = tokens_per_frame * T
+    
+    device = video_embeds.device
+
+    # 2. Compute Target Token Count
+    # We pass the token grid dims (H_tokens, W_tokens) not raw pixels
+    retained_tokens = compute_retained_tokens_count(
+        T=T, 
+        H_tokens=H_tokens, 
+        W_tokens=W_tokens, 
+        q=q, 
+        temporal_block_size=temporal_block_size,
+        spatial_block_size=spatial_block_size,
+        method="fps_spatiotemporal"
+    )
+
+    # 3. Prepare Points for FPS
+    points = video_embeds.reshape(total_tokens, video_embeds.size(-1)).to(torch.float32)
+    points = points / (torch.linalg.norm(points, dim=-1, keepdim=True) + 1e-8)
+    
+    # Optional: Random projection usually speeds up FPS distance calc
+    points = random_projection(points, target_dim=128)
+
+    # 4. Create Spatiotemporal Batch IDs
+    # We need to assign a unique Block ID to every token at (t, h, w)
+    
+    # Calculate number of blocks along each dimension
+    num_blocks_h = (H_tokens + spatial_block_size - 1) // spatial_block_size
+    num_blocks_w = (W_tokens + spatial_block_size - 1) // spatial_block_size
+    
+    # Generate indices for every token
+    t_idx = torch.arange(T, device=device) // temporal_block_size
+    h_idx = torch.arange(H_tokens, device=device) // spatial_block_size
+    w_idx = torch.arange(W_tokens, device=device) // spatial_block_size
+    
+    # Broadcast to create a volume (T, H_tokens, W_tokens)
+    # Shape: (T, 1, 1) + (1, H, 1) + (1, 1, W)
+    batch_grid = (
+        t_idx.view(T, 1, 1) * (num_blocks_h * num_blocks_w) + # Offset by full spatial planes
+        h_idx.view(1, H_tokens, 1) * num_blocks_w +           # Offset by full rows
+        w_idx.view(1, 1, W_tokens)                            # Offset columns
+    )
+    
+    # Flatten to match points (T * H * W)
+    batch = batch_grid.view(-1)
+
+    # 5. Run FPS
+    # Note: FPS implementation usually handles variable batch sizes correctly 
+    # if given a ratio.
+    sampled_indices = fps(
+        points,
+        batch=batch,
+        ratio=1.0-q,
+        random_start=True,
+    )
+
+    # 6. Final Mask
+    # Note: If your FPS implementation is inexact with ratios, we clip to valid range
+    sampled_indices = sampled_indices.view(-1)
+    
+    # Safety check: ensure we don't exceed calculated retention budget 
+    # (though FPS usually returns exactly calculated per-batch counts)
+    if sampled_indices.numel() > retained_tokens:
+         sampled_indices = sampled_indices[:retained_tokens]
+
+    retention_mask = torch.zeros(total_tokens, dtype=torch.bool, device=device)
+    retention_mask[sampled_indices] = True
+    return retention_mask        
+
+
 def compute_retention_mask_fps(
     video_embeds: torch.Tensor,
     video_size_thw: torch.LongTensor | tuple[int, int, int],
